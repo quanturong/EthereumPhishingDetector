@@ -1,0 +1,52 @@
+# Dataset (too large for git - host qua HTTP)
+dataset/
+dataset_bundle/
+*.pkl
+*.tar.gz
+*.7z
+*.zip
+
+# Etherscan raw txs
+hop1_txs/
+hop2_neighbor_txs/
+normal_hop1_txs/
+normal_testonly_hop1_txs/
+
+# Results & checkpoints
+*.pt
+*.pth
+results_*.json
+d2_*.json
+
+# Logs & temporary
+*.log
+*.txt
+!requirements.txt
+*.output
+prepare_bundle.log
+host_server.log
+stage*_crawl.log
+stage*_train.log
+
+# Original thesis outline (private)
+De_cuong_KLTN_*.docx
+BAO_CAO_ket_qua_thi_nghiem.md
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# OS
+Thumbs.db
+desktop.ini
