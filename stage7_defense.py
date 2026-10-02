@@ -1,43 +1,57 @@
 """
-Stage 7 - Defense mechanisms
-============================
-Theo dong 101-120 de cuong (Noi dung 3-4).
+Stage 7 - Phong thu (K=2)  -  chia 3 buoc vi 3 buoc can may khac nhau
+=====================================================================
+  make_pool : (may co du lieu tho, CPU)  sinh san TAP GIAO DICH DOI KHANG de huan luyen
+  train     : (Kaggle / may co GPU)      huan luyen AdvTrain / RA-SAGE
+  eval      : (may co du lieu tho, CPU)  danh gia clean + known + unseen attack
 
-Hai phuong phap phong thu:
-  1. AdvTrain-SAGE       (baseline defense): SAGE + adversarial training
-  2. Reliability-Aware   (RA-SAGE):          SAGE + edge reliability weighting
-                                              + adversarial training + consistency loss
+Phuong phap:
+  advtrain  : GraphSAGE + adversarial training (duong co so)
+  ra        : RA-SAGE = SAGE + trong so tin cay canh r(e) + adversarial training
+              + consistency loss (so sanh dung CAP clean/adv cua cung 1 target)
+  ra_noedge : doi chung (ablation) - nhu 'ra' nhung r(e) KHONG nhin edge_attr
+              (de biet loi ich co den tu thong tin canh hay chi tu viec co co che r(e))
 
-Reliability score r(e) in [0,1] cho moi canh, tinh tu:
-  - Edge features (log-transformed value, timestamp, gas)
-  - Node context (features cua src va dst)
+Nhom tan cong:
+  KNOWN  = TOH, TIH, BPH-T2P, BPH-P2T   (dung de sinh mau huan luyen)
+  UNSEEN = STC, MWR(round-trip)          (KHONG dung trong huan luyen)
 
-Danh gia:
-  - Clean test
-  - Known attacks (TOH, TIH, BPH-T2P, BPH-P2T) - dung trong training
-  - Unseen attacks (STC, MWR) - KHONG trong training, kiem tra khai quat hoa
+Thay doi so voi ban K=1:
+  - Mau doi khang sinh bang dung ham dung graph K=2 cua Stage 6/9c, voi CUTOFF CUA TRAIN (T1),
+    khong dung T_end (truoc day mau adv co lich su dai hon clean -> loi tat thoi gian).
+    Tx goc dua cho tan cong bi cat <= cutoff de tx gia nam TRONG cua so quan sat.
+  - Consistency loss ghep dung cap (clean, adv) cua CUNG target (truoc day ghep ngau nhien).
+  - Tap adv sinh 1 lan (co dinh), khong dung lai graph moi epoch -> huan luyen nhanh tren GPU.
+  - Dung lai feat_stats cua Stage 5 (cung chuan hoa de so sanh cong bang voi baseline).
+  - eval dung 1 luot qua test cho TAT CA mo hinh (baseline, advtrain, ra, ra_noedge), luu xac
+    suat tung mau (.npz) de sau nay kiem dinh ghep cap.
 
 Cach chay:
-  python stage7_defense.py --method advtrain --epochs 60
-  python stage7_defense.py --method ra       --epochs 60
-  python stage7_defense.py --method both     --epochs 60
+  # 1) may co du lieu (~15-30 phut)
+  python stage7_defense.py make_pool --stage5_dir D:\\NCKH\\Final\\results\\stage5_k2
+  # 2) Kaggle (xem huong dan): train tung phuong phap
+  python stage7_defense.py train --method advtrain --pkl <pkl> --pool <adv_pool_train.pkl> --stage5_dir <dir> --out <dir>
+  # 3) may co du lieu
+  python stage7_defense.py eval --stage5_dir D:\\NCKH\\Final\\results\\stage5_k2 --defense_dir <thu muc chua model_*.pt>
 """
 
 import argparse
+import gc
 import json
 import pickle
 import sys
 import time
+import zlib
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.data import Data
+from sklearn.metrics import f1_score
+from torch_geometric.data import Batch
 from torch_geometric.loader import DataLoader
-from torch_geometric.nn import MessagePassing, SAGEConv, global_max_pool, global_mean_pool
+from torch_geometric.nn import MessagePassing, global_max_pool, global_mean_pool
 from tqdm import tqdm
 
 try:
@@ -46,67 +60,57 @@ try:
 except Exception:
     pass
 
-from stage3_pipeline import _build_one_ego_graph, PHISHING_HOP1_DIR
-from stage5_train_baselines import (
-    GraphSAGEModel, compute_feature_stats, evaluate, to_pyg,
-)
-from stage6_adversarial_attacks import (
-    ATTACKS, TXS_PER_UNIT, _load_raw_txs, predict_probs,
-)
+from stage5_train_baselines import GraphSAGEModel, evaluate, to_pyg
 
-# --- Paths -------------------------------------------------------------------
-BASE_DIR    = Path(r"E:\EthereumPhishingDetection\dataset\EthPhishGraph-2026")
-STAGE3_DIR  = BASE_DIR / "ethphishgraph2026_stage3_dataset"
-STAGE7_DIR  = BASE_DIR / "ethphishgraph2026_stage7_defense"
-DATASET_PKL = STAGE3_DIR / "ego_graph_dataset.pkl"
+BASE_DIR   = Path(r"D:\NCKH\Final")
+STAGE5_DIR = BASE_DIR / "results" / "stage5_k2"
+STAGE7_DIR = BASE_DIR / "ethphishgraph2026_stage7_defense_k2"
 
 KNOWN_ATTACKS  = ["TOH", "TIH", "BPH-T2P", "BPH-P2T"]
 UNSEEN_ATTACKS = ["STC", "MWR"]
+ALL_ATTACKS    = KNOWN_ATTACKS + UNSEEN_ATTACKS
+POOL_BUDGETS   = [1, 3, 5, 10]
+CONS_METHODS   = {"ra", "ra_noedge"}
 
 
-# --- Reliability-Aware SAGE Conv --------------------------------------------
+# --- RA-SAGE ------------------------------------------------------------------
 class RASAGEConv(MessagePassing):
     """
-    SAGE aggregator voi edge reliability weighting.
-      r(e) = sigmoid(MLP([h_src, h_dst, edge_attr]))
-      h'_v = W_self * h_v + W_msg * mean(r(e) * h_u for u in N(v))
+    SAGE co trong so tin cay canh:
+      r(e) = sigmoid(MLP([h_src, h_dst, edge_attr]))      (edge_dim=0: bo edge_attr)
+      h'_v = W_self h_v + mean_{u in N(v)} r(e_uv) * W_msg h_u
     """
-    def __init__(self, in_dim: int, out_dim: int, edge_dim: int, hid: int = 32):
+    def __init__(self, in_dim, out_dim, edge_dim, hid=32):
         super().__init__(aggr="mean")
-        self.lin_msg  = nn.Linear(in_dim, out_dim)
+        self.edge_dim = edge_dim
+        self.lin_msg = nn.Linear(in_dim, out_dim)
         self.lin_self = nn.Linear(in_dim, out_dim)
-        self.rel_mlp  = nn.Sequential(
-            nn.Linear(2 * in_dim + edge_dim, hid),
-            nn.ReLU(),
-            nn.Linear(hid, 1),
-        )
-        self.last_r = None  # cache reliability scores for logging
+        self.rel_mlp = nn.Sequential(
+            nn.Linear(2 * in_dim + edge_dim, hid), nn.ReLU(), nn.Linear(hid, 1))
+        self.last_r = None
 
     def forward(self, x, edge_index, edge_attr):
         src, dst = edge_index
-        rel_input = torch.cat([x[src], x[dst], edge_attr], dim=1)
-        r = torch.sigmoid(self.rel_mlp(rel_input))     # [E, 1]
+        feats = [x[src], x[dst]]
+        if self.edge_dim:
+            feats.append(edge_attr)
+        r = torch.sigmoid(self.rel_mlp(torch.cat(feats, dim=1)))   # [E, 1]
         self.last_r = r.detach()
-        out = self.propagate(edge_index, x=x, r=r, edge_attr=edge_attr)
-        return self.lin_self(x) + out
+        return self.lin_self(x) + self.propagate(edge_index, x=x, r=r)
 
     def message(self, x_j, r):
         return r * self.lin_msg(x_j)
 
 
 class RASAGEModel(nn.Module):
-    """Reliability-Aware GraphSAGE."""
-    def __init__(self, in_dim: int, edge_dim: int, hid: int = 64, num_layers: int = 2, dropout: float = 0.3):
+    def __init__(self, in_dim, edge_dim, hid=64, num_layers=2, dropout=0.3):
         super().__init__()
-        self.convs = nn.ModuleList()
-        self.convs.append(RASAGEConv(in_dim, hid, edge_dim))
+        self.convs = nn.ModuleList([RASAGEConv(in_dim, hid, edge_dim)])
         for _ in range(num_layers - 1):
             self.convs.append(RASAGEConv(hid, hid, edge_dim))
         self.dropout = dropout
         self.head = nn.Sequential(
-            nn.Linear(hid * 2, hid), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(hid, 2),
-        )
+            nn.Linear(hid * 2, hid), nn.ReLU(), nn.Dropout(dropout), nn.Linear(hid, 2))
 
     def forward(self, data):
         x, ei, ea, batch = data.x, data.edge_index, data.edge_attr, data.batch
@@ -117,273 +121,352 @@ class RASAGEModel(nn.Module):
         return self.head(g)
 
 
-# --- Adversarial sample generator ---------------------------------------------
-def gen_adv_sample(raw_txs: list[dict], target: str, label: int, T_end: int,
-                   known_attacks: list[str], rng: np.random.Generator) -> dict | None:
-    """Sinh 1 mau doi khang tu 1 target phishing. Random attack + random budget."""
-    if label != 1:
-        return None
-    if not raw_txs:
-        return None
-    atk = rng.choice(known_attacks)
-    budget = int(rng.choice([1, 3, 5, 10]))
-    pert_txs = ATTACKS[atk](raw_txs, target, budget, rng)
-    return _build_one_ego_graph(target, 1, T_end, pert_txs)
+def make_model(method: str, in_dim: int, edge_dim: int):
+    if method in ("baseline", "advtrain"):
+        return GraphSAGEModel(in_dim=in_dim)
+    if method == "ra":
+        return RASAGEModel(in_dim, edge_dim)
+    if method == "ra_noedge":
+        return RASAGEModel(in_dim, 0)
+    raise ValueError(method)
 
 
-def build_adv_pool(train_raw_graphs: list[dict], T_end: int, rng: np.random.Generator,
-                   n_per_epoch: int) -> list[dict]:
-    """
-    Sinh n_per_epoch mau adv tu tap phishing training.
-    Goi 1 lan moi epoch de train mo hinh voi adv examples da them.
-    """
-    phish_targets = [g for g in train_raw_graphs if g["label"] == 1]
-    if not phish_targets:
-        return []
-    adv_samples = []
-    attempts = 0
-    while len(adv_samples) < n_per_epoch and attempts < n_per_epoch * 3:
-        g = phish_targets[int(rng.integers(0, len(phish_targets)))]
-        raw = _load_raw_txs(g["target"])
-        adv = gen_adv_sample(raw, g["target"], 1, T_end, KNOWN_ATTACKS, rng)
-        if adv is not None:
-            adv_samples.append(adv)
-        attempts += 1
-    return adv_samples
+# =============================== make_pool ====================================
+def cmd_make_pool(args):
+    import pandas as pd
+    import stage9_k2_upgrade as k2
+    import stage6_adversarial_attacks as s6
+
+    if args.base_dir:
+        s6._set_base(Path(args.base_dir))
+    out_dir = Path(args.out or STAGE7_DIR)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    split = pd.read_csv(k2.SPLIT_CSV)
+    meta = json.loads(k2.SPLIT_META.read_text(encoding="utf-8"))
+    t1 = int(meta["T1_ts"])
+    label_of = dict(zip(split["address"].str.lower(), split["label"].astype(int)))
+    train_ph = split[(split["partition"] == "train") & (split["label"] == 1)].reset_index(drop=True)
+    if args.max_targets:
+        train_ph = train_ph.head(args.max_targets)
+    print(f"Train phishing targets: {len(train_ph)} | variants/target: {args.variants} | cutoff T1={t1}")
+
+    pool, skipped_invalid, skipped_none = [], 0, 0
+    for _, row in tqdm(train_ph.iterrows(), total=len(train_ph), unit="tgt"):
+        addr = row["address"].lower()
+        c = s6.TargetCache(addr, 1, t1, label_of)
+        raw_in = [t for t in c.txs if int(t.get("timeStamp", 0) or 0) <= t1]   # chi tx trong cua so
+        if not raw_in:
+            skipped_none += 1
+            continue
+        last_real = s6._last_ts(raw_in)
+        for v in range(args.variants):
+            rng = np.random.default_rng([args.seed, zlib.crc32(addr.encode()), v, 7])
+            atk = str(rng.choice(KNOWN_ATTACKS))
+            b = int(rng.choice(POOL_BUDGETS))
+            new, wal = s6.ATTACKS[atk](raw_in, addr, b, rng, c.pool)
+            errs = s6.validate_new_txs(new, wal, addr, last_real, t1, b * s6.TXS_PER_UNIT[atk])
+            if errs:                       # vd: tx gia tran qua cutoff T1
+                skipped_invalid += 1
+                continue
+            g = s6.build_graph(c, new)
+            if g is None:
+                skipped_none += 1
+                continue
+            pool.append({
+                "target": addr, "label": 1, "target_idx": int(g["target_idx"]),
+                "node_features": g["node_features"].astype(np.float32),
+                "edge_index": g["edge_index"].astype(np.int32),
+                "edge_attr": g["edge_attr"].astype(np.float32),
+                "attack": atk, "budget": b,
+            })
+    from collections import Counter
+    print(f"Pool: {len(pool)} mau | bo qua (tx vuot cutoff): {skipped_invalid} | bo qua (khac): {skipped_none}")
+    print("Theo tan cong:", dict(Counter(p["attack"] for p in pool)))
+    out = out_dir / "adv_pool_train.pkl"
+    with open(out, "wb") as f:
+        pickle.dump({"pool": pool, "T1": t1, "known": KNOWN_ATTACKS, "seed": args.seed}, f,
+                    protocol=pickle.HIGHEST_PROTOCOL)
+    print(f"Saved -> {out} ({out.stat().st_size / 1e6:.0f} MB)")
 
 
-# --- Training with adversarial samples + consistency -------------------------
+# ================================ train =======================================
 def kl_consistency(logits_clean, logits_adv):
-    """KL(clean || adv) ep prediction cua adv gan clean."""
+    """KL(p_clean || p_adv); p_clean khong nhan gradient."""
     p_clean = F.softmax(logits_clean, dim=1).detach()
-    log_p_adv = F.log_softmax(logits_adv, dim=1)
-    return F.kl_div(log_p_adv, p_clean, reduction="batchmean")
+    return F.kl_div(F.log_softmax(logits_adv, dim=1), p_clean, reduction="batchmean")
 
 
-def train_defense(method: str, model, train_raw_graphs, train_ds, val_ds,
-                  feat_stats, T_end, device, epochs=60, lr=1e-3, bs=64,
-                  patience=12, adv_ratio=0.5, cons_weight=0.5, seed=42):
-    """
-    method: 'advtrain' or 'ra'
-    - Moi epoch, sinh adv pool tu training phishing targets.
-    - Mix clean + adv trong training batch.
-    - Neu method='ra': them consistency loss KL(clean, adv) tren cung target.
-    """
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    rng = np.random.default_rng(seed)
+def cmd_train(args):
+    method = args.method
+    out_dir = Path(args.out or STAGE7_DIR)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stage5_dir = Path(args.stage5_dir or STAGE5_DIR)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.manual_seed(args.seed); np.random.seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    rng = np.random.default_rng(args.seed)
+    print(f"Device: {device} | method: {method} | seed: {args.seed}")
 
-    train_y = np.array([g.y.item() for g in train_ds])
-    cw = torch.tensor(
-        [len(train_y) / (2 * (train_y == 0).sum()),
-         len(train_y) / (2 * (train_y == 1).sum())],
-        dtype=torch.float,
-    ).to(device)
+    stats = torch.load(stage5_dir / "feat_stats.pt", map_location="cpu", weights_only=True)
 
-    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=5e-4)
-    val_loader = DataLoader(val_ds, batch_size=bs)
+    print(f"Loading {args.pkl} ...")
+    with open(args.pkl, "rb") as f:
+        raw = pickle.load(f)
+    train_ds = [to_pyg(g, stats) for g in raw["train"]]
+    addr2idx = {g["target"]: i for i, g in enumerate(raw["train"])}
+    val_ds = [to_pyg(g, stats) for g in raw["val"]]
+    test_ds = [to_pyg(g, stats) for g in raw["test"]]
+    del raw; gc.collect()
+    for i, d in enumerate(train_ds):
+        d.is_adv = torch.tensor([False]); d.pair_idx = torch.tensor([-1])
 
-    best_val, best_state, wait = -1.0, None, 0
-    n_phish_train = int((train_y == 1).sum())
-    n_adv_per_epoch = int(adv_ratio * n_phish_train)
+    with open(args.pool, "rb") as f:
+        pool = pickle.load(f)["pool"]
+    adv_ds = []
+    for p in pool:
+        if p["target"] not in addr2idx:
+            continue
+        d = to_pyg(p, stats)
+        d.is_adv = torch.tensor([True]); d.pair_idx = torch.tensor([addr2idx[p["target"]]])
+        adv_ds.append(d)
+    del pool; gc.collect()
+    print(f"train={len(train_ds)} val={len(val_ds)} test={len(test_ds)} adv_pool={len(adv_ds)}")
 
-    for ep in range(1, epochs + 1):
+    if args.smoke:    # chay thu nhanh: 300 train, 200 val, 1 epoch
+        keep = set(rng.choice(len(train_ds), size=min(300, len(train_ds)), replace=False).tolist())
+        remap = {old: new for new, old in enumerate(sorted(keep))}
+        train_ds = [train_ds[i] for i in sorted(keep)]
+        adv_ds = [d for d in adv_ds if int(d.pair_idx) in remap]
+        for d in adv_ds: d.pair_idx = torch.tensor([remap[int(d.pair_idx)]])
+        val_ds = val_ds[:200]; args.epochs = 1
+        print(f"SMOKE: train={len(train_ds)} adv={len(adv_ds)} val={len(val_ds)}")
+
+    in_dim = train_ds[0].x.size(1)
+    edge_dim = train_ds[0].edge_attr.size(1)
+    model = make_model(method, in_dim, edge_dim).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=5e-4)
+
+    ty = np.array([d.y.item() for d in train_ds])
+    cw = torch.tensor([len(ty) / (2 * (ty == 0).sum()), len(ty) / (2 * (ty == 1).sum())],
+                      dtype=torch.float).to(device)
+    val_loader = DataLoader(val_ds, batch_size=args.bs)
+    n_adv_epoch = min(int(args.adv_ratio * int((ty == 1).sum())), len(adv_ds))
+    use_cons = method in CONS_METHODS
+
+    best_val, best_state, wait, hist = -1.0, None, 0, []
+    for ep in range(1, args.epochs + 1):
         t0 = time.time()
-
-        # Sinh adv pool cho epoch nay
-        adv_graphs = build_adv_pool(train_raw_graphs, T_end, rng, n_adv_per_epoch)
-        adv_ds = [to_pyg(g, feat_stats) for g in adv_graphs]
-
-        # Combine clean + adv
-        combined = train_ds + adv_ds
-        combined_loader = DataLoader(combined, batch_size=bs, shuffle=True)
-
+        pick = rng.choice(len(adv_ds), size=n_adv_epoch, replace=False) if n_adv_epoch else []
+        loader = DataLoader(train_ds + [adv_ds[i] for i in pick], batch_size=args.bs, shuffle=True)
         model.train()
-        total_loss = 0.0
-        n_seen = 0
-        for batch in combined_loader:
+        tot, seen = 0.0, 0
+        for batch in loader:
             batch = batch.to(device)
             opt.zero_grad()
             logits = model(batch)
             loss = F.cross_entropy(logits, batch.y, weight=cw)
-
-            # Consistency loss cho method='ra': lay 1 batch nho tu clean/adv paired
-            if method == "ra" and adv_ds and len(adv_ds) >= 8:
-                idx = rng.choice(len(adv_ds), size=min(8, len(adv_ds)), replace=False)
-                adv_batch = next(iter(DataLoader([adv_ds[i] for i in idx], batch_size=8))).to(device)
-                # Tim clean tuong ung: khong mapping thuan tien -> tao random clean batch
-                cln_idx = rng.choice(len(train_ds), size=min(8, len(train_ds)), replace=False)
-                cln_batch = next(iter(DataLoader([train_ds[i] for i in cln_idx], batch_size=8))).to(device)
-                l_clean = model(cln_batch)
-                l_adv   = model(adv_batch)
-                loss = loss + cons_weight * kl_consistency(l_clean, l_adv)
-
+            if use_cons:
+                m = batch.is_adv.bool()
+                if m.any():
+                    ids = batch.pair_idx[m].tolist()          # chi so cac clean TUONG UNG
+                    clean_b = Batch.from_data_list([train_ds[i] for i in ids]).to(device)
+                    loss = loss + args.cons_weight * kl_consistency(model(clean_b), logits[m])
             loss.backward()
             opt.step()
-            total_loss += float(loss) * batch.num_graphs
-            n_seen += batch.num_graphs
-        train_loss = total_loss / max(n_seen, 1)
-
-        # Val
+            tot += float(loss.detach()) * batch.num_graphs
+            seen += batch.num_graphs
         vm = evaluate(model, val_loader, device)
+        hist.append({"epoch": ep, "train_loss": tot / max(seen, 1), **vm})
         if vm["macro_f1"] > best_val:
-            best_val   = vm["macro_f1"]
+            best_val, wait = vm["macro_f1"], 0
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
-            wait = 0
         else:
             wait += 1
-
         if ep % 5 == 0 or ep == 1:
-            print(f"  [ep {ep:2d}] {time.time()-t0:5.1f}s  "
-                  f"n_adv={len(adv_ds):4d}  loss={train_loss:.4f}  "
-                  f"val_f1={vm['macro_f1']:.4f}  best={best_val:.4f}")
-        if wait >= patience:
+            print(f"  [ep {ep:3d}] {time.time() - t0:5.1f}s loss={tot / max(seen, 1):.4f} "
+                  f"val_f1={vm['macro_f1']:.4f} best={best_val:.4f}")
+        if wait >= args.patience:
             print(f"  Early stop tai epoch {ep}")
             break
 
-    if best_state is not None:
-        model.load_state_dict(best_state)
-    return model, best_val
+    model.load_state_dict(best_state)
+    tm = evaluate(model, DataLoader(test_ds, batch_size=args.bs), device)
+    print(f"-> Clean test: macro_f1={tm['macro_f1']:.4f} pr_auc={tm['pr_auc']:.4f} "
+          f"phish_recall={tm['rec_phishing']:.4f}")
+    tag = f"{method}_seed{args.seed}" + ("_smoke" if args.smoke else "")
+    torch.save(model.state_dict(), out_dir / f"model_{tag}.pt")
+    (out_dir / f"train_{tag}.json").write_text(
+        json.dumps({"best_val_macro_f1": best_val, "clean_test": tm, "history": hist}, indent=2),
+        encoding="utf-8")
+    print(f"Saved -> {out_dir / f'model_{tag}.pt'}")
 
 
-# --- Robustness evaluation across known + unseen attacks ---------------------
-@torch.no_grad()
-def eval_all_attacks(model, phish_test_graphs, attacks: list[str], budgets: list[int],
-                     feat_stats, T_end, device, seed=42) -> dict:
-    """Return per-attack per-budget ASR + robust_recall."""
-    rng = np.random.default_rng(seed)
-    clean_probs = predict_probs(model, phish_test_graphs, feat_stats, device)
-    clean_pred  = (clean_probs >= 0.5).astype(int)
-    correct_mask = clean_pred == 1
-    n_correct = int(correct_mask.sum())
-
-    out = {"clean_recall": float(n_correct / len(phish_test_graphs)),
-           "n_correct_clean": n_correct, "attacks": {}}
-
+# ================================ eval ========================================
+def summarize(y, cp, atk_probs, attacks, budgets, txs_per_unit):
+    """y: nhan tat ca target test; cp: P(phishing) clean; atk_probs[atk][b]: P tung mau phishing."""
+    y, cp = np.asarray(y), np.asarray(cp)
+    cpred = (cp >= 0.5).astype(int)
+    ph = y == 1
+    n_ph = int(ph.sum())
+    correct = cpred[ph] == 1
+    n_correct = int(correct.sum())
+    res = {"n_phishing": n_ph, "n_correct_clean": n_correct,
+           "clean_macro_f1": float(f1_score(y, cpred, average="macro", zero_division=0)),
+           "clean_phish_recall": n_correct / max(n_ph, 1), "attacks": {}}
+    any_flip = np.zeros(n_ph, dtype=bool)
     for atk in attacks:
-        out["attacks"][atk] = []
+        rows = []
         for b in budgets:
-            perturbed = []
-            for g in phish_test_graphs:
-                raw = _load_raw_txs(g["target"])
-                if not raw:
-                    perturbed.append(g); continue
-                pt = ATTACKS[atk](raw, g["target"], b, rng)
-                pg = _build_one_ego_graph(g["target"], 1, T_end, pt)
-                perturbed.append(pg if pg is not None else g)
-            atk_probs = predict_probs(model, perturbed, feat_stats, device)
-            atk_pred  = (atk_probs >= 0.5).astype(int)
-            flipped   = correct_mask & (atk_pred == 0)
-            asr           = float(flipped.sum() / max(n_correct, 1))
-            robust_recall = float((atk_pred == 1).sum() / len(phish_test_graphs))
-            out["attacks"][atk].append({
-                "budget": b, "amt": b * TXS_PER_UNIT[atk],
-                "asr": asr, "robust_recall": robust_recall,
-                "n_flipped": int(flipped.sum()),
-            })
-            print(f"    [{atk:8s} b={b:3d}] ASR={asr:.3f}  rob_rec={robust_recall:.3f}")
-    return out
+            ap = np.asarray(atk_probs[atk][b]) >= 0.5
+            flipped = correct & ~ap
+            any_flip |= flipped
+            pred = cpred.copy(); pred[ph] = ap.astype(int)
+            rows.append({"budget": b, "amt": b * txs_per_unit[atk],
+                         "asr": float(flipped.sum() / max(n_correct, 1)),
+                         "n_flipped": int(flipped.sum()),
+                         "robust_recall": float(ap.sum() / max(n_ph, 1)),
+                         "robust_macro_f1": float(f1_score(y, pred, average="macro", zero_division=0))})
+        res["attacks"][atk] = {"budgets": rows, "mean_asr": float(np.mean([r["asr"] for r in rows]))}
+    res["asr_any"] = float(any_flip.sum() / max(n_correct, 1))
+    res["n_flipped_any"] = int(any_flip.sum())
+    for name, group in (("known", KNOWN_ATTACKS), ("unseen", UNSEEN_ATTACKS)):
+        ms = [res["attacks"][a]["mean_asr"] for a in group if a in res["attacks"]]
+        res[f"mean_asr_{name}"] = float(np.mean(ms)) if ms else None
+    return res
 
 
-# --- Main --------------------------------------------------------------------
-def main():
-    parser = argparse.ArgumentParser(description="Stage 7 - Defense mechanisms")
-    parser.add_argument("--method", choices=["advtrain", "ra", "both"], default="both")
-    parser.add_argument("--epochs", type=int, default=60)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--bs", type=int, default=64)
-    parser.add_argument("--patience", type=int, default=12)
-    parser.add_argument("--adv_ratio", type=float, default=0.5)
-    parser.add_argument("--cons_weight", type=float, default=0.5)
-    parser.add_argument("--budgets", nargs="+", type=int, default=[1, 5, 10, 20])
-    parser.add_argument("--seed", type=int, default=42)
-    args = parser.parse_args()
+def cmd_eval(args):
+    import pandas as pd
+    import stage9_k2_upgrade as k2
+    import stage6_adversarial_attacks as s6
 
-    STAGE7_DIR.mkdir(parents=True, exist_ok=True)
+    stage5_dir = Path(args.stage5_dir or STAGE5_DIR)
+    out_dir = Path(args.out or STAGE7_DIR)
+    if args.base_dir:
+        s6._set_base(Path(args.base_dir))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    defense_dir = Path(args.defense_dir) if args.defense_dir else out_dir
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device}")
 
-    # Load data
-    with open(DATASET_PKL, "rb") as f:
-        raw = pickle.load(f)
-    stats = compute_feature_stats(raw["train"])
-    train_ds = [to_pyg(g, stats) for g in raw["train"]]
-    val_ds   = [to_pyg(g, stats) for g in raw["val"]]
-    test_ds  = [to_pyg(g, stats) for g in raw["test"]]
-    in_dim   = train_ds[0].x.size(1)
-    edge_dim = train_ds[0].edge_attr.size(1)
-    print(f"in_dim={in_dim}, edge_dim={edge_dim}")
+    stats = torch.load(stage5_dir / "feat_stats.pt", map_location="cpu", weights_only=True)
+    in_dim = int(stats["node_mean"].numel())
+    edge_dim = int(stats["edge_mean"].numel())
 
-    split_df = pd.read_csv(STAGE3_DIR / "temporal_split.csv")
-    T_end = int(split_df["anchor_ts"].max()) + 10 * 365 * 24 * 3600
+    models = {}
+    for m in args.methods:
+        ck = (stage5_dir / f"model_graphsage_seed{args.seed}.pt") if m == "baseline" \
+            else defense_dir / f"model_{m}_seed{args.seed}.pt"
+        net = make_model(m, in_dim, edge_dim).to(device)
+        net.load_state_dict(torch.load(ck, map_location=device, weights_only=True))
+        net.eval()
+        models[m] = net
+        print(f"Loaded {m}: {ck}")
 
-    phish_test = [g for g in raw["test"] if g["label"] == 1]
-    print(f"Phishing test: {len(phish_test)}")
+    split = pd.read_csv(k2.SPLIT_CSV)
+    t_end = int(split["anchor_ts"].max()) + 10 * 365 * 24 * 3600
+    label_of = dict(zip(split["address"].str.lower(), split["label"].astype(int)))
+    test = split[split["partition"] == "test"].reset_index(drop=True)
+    if args.max_targets:
+        test = test.sample(n=min(args.max_targets, len(test)), random_state=0).reset_index(drop=True)
+    print(f"Test targets: {len(test)} (phishing={int((test['label'] == 1).sum())})")
 
-    methods = ["advtrain", "ra"] if args.method == "both" else [args.method]
-    all_results = {}
+    ys = []
+    cp = {m: [] for m in models}
+    ap = {m: {a: {b: [] for b in args.budgets} for a in ALL_ATTACKS} for m in models}
+    invalid = 0
+    t0 = time.time()
+    for _, row in tqdm(test.iterrows(), total=len(test), unit="tgt"):
+        addr, label = row["address"].lower(), int(row["label"])
+        c = s6.TargetCache(addr, label, t_end, label_of)
+        g0 = s6.build_graph(c)
+        if g0 is None:
+            continue
+        graphs, tags = [g0], [("clean", 0)]
+        if label == 1:
+            last_real = s6._last_ts(c.txs)
+            for ai, atk in enumerate(ALL_ATTACKS):
+                for b in args.budgets:
+                    new, wal = s6.ATTACKS[atk](c.txs, addr, b, s6._atk_rng(args.attack_seed, addr, ai, b), c.pool)
+                    if s6.validate_new_txs(new, wal, addr, last_real, t_end, b * s6.TXS_PER_UNIT[atk]):
+                        invalid += 1
+                    pg = s6.build_graph(c, new)
+                    graphs.append(pg if pg is not None else g0)
+                    tags.append((atk, b))
+        ys.append(label)
+        for m, net in models.items():
+            p = s6.predict_graphs(net, graphs, stats, device)
+            cp[m].append(float(p[0]))
+            if label == 1:
+                for (atk, b), pv in zip(tags[1:], p[1:]):
+                    ap[m][atk][b].append(float(pv))
+    print(f"\nThoi gian: {(time.time() - t0) / 60:.1f} phut | tx khong hop le: {invalid}")
 
-    for m in methods:
-        print(f"\n{'='*70}\n Training defense: {m.upper()}\n{'='*70}")
-        if m == "advtrain":
-            model = GraphSAGEModel(in_dim=in_dim).to(device)
-        else:
-            model = RASAGEModel(in_dim=in_dim, edge_dim=edge_dim).to(device)
+    results = {m: summarize(ys, cp[m], ap[m], ALL_ATTACKS, args.budgets, s6.TXS_PER_UNIT) for m in models}
+    tag = f"seed{args.seed}" + (f"_{args.tag}" if args.tag else "")
+    (out_dir / f"eval_{tag}.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
+    np.savez_compressed(out_dir / f"eval_probs_{tag}.npz",
+                        labels=np.array(ys),
+                        **{f"{m}__clean": np.array(cp[m]) for m in models},
+                        **{f"{m}__{a}__{b}": np.array(ap[m][a][b])
+                           for m in models for a in ALL_ATTACKS for b in args.budgets})
 
-        model, best_val = train_defense(
-            method=m, model=model, train_raw_graphs=raw["train"],
-            train_ds=train_ds, val_ds=val_ds,
-            feat_stats=stats, T_end=T_end, device=device,
-            epochs=args.epochs, lr=args.lr, bs=args.bs, patience=args.patience,
-            adv_ratio=args.adv_ratio, cons_weight=args.cons_weight, seed=args.seed,
-        )
-        ckpt = STAGE7_DIR / f"model_{m}.pt"
-        torch.save(model.state_dict(), ckpt)
-        print(f"Saved {ckpt}")
+    base = results.get("baseline")
+    print(f"\n{'=' * 96}\n ASR trung binh theo ngan sach (thap hon = tot hon). Chi con {len(models)} mo hinh.\n{'=' * 96}")
+    print(f"{'Mo hinh':<11s}{'cleanF1':>8s}{'recall':>8s} |" + "".join(f"{a:>9s}" for a in ALL_ATTACKS)
+          + f" |{'known':>7s}{'unseen':>8s}{'ANY':>7s}")
+    for m, r in results.items():
+        row = f"{m:<11s}{r['clean_macro_f1']:>8.3f}{r['clean_phish_recall']:>8.3f} |"
+        row += "".join(f"{r['attacks'][a]['mean_asr']:>9.3f}" for a in ALL_ATTACKS)
+        row += f" |{r['mean_asr_known']:>7.3f}{r['mean_asr_unseen']:>8.3f}{r['asr_any']:>7.3f}"
+        print(row)
+    if base:
+        print("\nThay doi so voi baseline (am = phong thu giam ASR; clean: am = mat hieu nang):")
+        for m, r in results.items():
+            if m == "baseline":
+                continue
+            print(f"  {m:<10s} dCleanF1={r['clean_macro_f1'] - base['clean_macro_f1']:+.3f}  "
+                  f"dASR_known={r['mean_asr_known'] - base['mean_asr_known']:+.3f}  "
+                  f"dASR_unseen={r['mean_asr_unseen'] - base['mean_asr_unseen']:+.3f}")
+    print(f"\nSaved -> {out_dir / f'eval_{tag}.json'}")
 
-        # Clean eval
-        test_loader = DataLoader(test_ds, batch_size=args.bs)
-        clean = evaluate(model, test_loader, device)
-        print(f"\n  Clean test: macro_f1={clean['macro_f1']:.4f}  "
-              f"pr_auc={clean['pr_auc']:.4f}  phish_recall={clean['rec_phishing']:.4f}")
 
-        # Known attacks eval
-        print(f"\n  === Known attacks (in training) ===")
-        known_r = eval_all_attacks(model, phish_test, KNOWN_ATTACKS, args.budgets,
-                                   stats, T_end, device, seed=args.seed)
+# ================================ main ========================================
+def main():
+    ap = argparse.ArgumentParser(description="Stage 7 - Defense (K=2)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
 
-        # Unseen attacks eval
-        print(f"\n  === Unseen attacks (NOT in training) ===")
-        unseen_r = eval_all_attacks(model, phish_test, UNSEEN_ATTACKS, args.budgets,
-                                    stats, T_end, device, seed=args.seed)
+    p = sub.add_parser("make_pool", help="sinh tap tx doi khang de huan luyen (may co du lieu tho)")
+    p.add_argument("--variants", type=int, default=2, help="so mau doi khang / target phishing train")
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--max_targets", type=int, default=0)
+    p.add_argument("--out", default=None); p.add_argument("--base_dir", default=None)
+    p.add_argument("--stage5_dir", default=None)
 
-        all_results[m] = {
-            "clean": clean, "best_val": best_val,
-            "known":  known_r["attacks"],
-            "unseen": unseen_r["attacks"],
-            "clean_recall": known_r["clean_recall"],
-            "n_correct_clean": known_r["n_correct_clean"],
-        }
+    t = sub.add_parser("train", help="huan luyen phong thu (Kaggle/GPU)")
+    t.add_argument("--method", choices=["advtrain", "ra", "ra_noedge"], required=True)
+    t.add_argument("--pkl", required=True); t.add_argument("--pool", required=True)
+    t.add_argument("--stage5_dir", default=None); t.add_argument("--out", default=None)
+    t.add_argument("--epochs", type=int, default=60); t.add_argument("--lr", type=float, default=1e-3)
+    t.add_argument("--bs", type=int, default=64); t.add_argument("--patience", type=int, default=12)
+    t.add_argument("--adv_ratio", type=float, default=0.5); t.add_argument("--cons_weight", type=float, default=0.5)
+    t.add_argument("--seed", type=int, default=42)
+    t.add_argument("--smoke", action="store_true", help="chay thu nhanh 1 epoch tren tap nho")
 
-    out = STAGE7_DIR / f"results_{args.method}.json"
-    with open(out, "w", encoding="utf-8") as f:
-        json.dump(all_results, f, indent=2)
-    print(f"\nSaved -> {out}")
+    e = sub.add_parser("eval", help="danh gia clean + known + unseen (may co du lieu tho)")
+    e.add_argument("--methods", nargs="+", default=["baseline", "advtrain", "ra"],
+                   choices=["baseline", "advtrain", "ra", "ra_noedge"])
+    e.add_argument("--seed", type=int, default=42, help="seed cua checkpoint")
+    e.add_argument("--attack_seed", type=int, default=42)
+    e.add_argument("--budgets", nargs="+", type=int, default=[1, 3, 5, 10, 20])
+    e.add_argument("--max_targets", type=int, default=0)
+    e.add_argument("--stage5_dir", default=None); e.add_argument("--defense_dir", default=None)
+    e.add_argument("--out", default=None); e.add_argument("--base_dir", default=None)
+    e.add_argument("--tag", default="")
 
-    # Summary table
-    print(f"\n{'='*80}\n SUMMARY: mean ASR across budgets\n{'='*80}")
-    print(f"{'Method':<12s} {'Group':<8s} {'TOH':<8s} {'TIH':<8s} {'BPH-T2P':<10s} {'BPH-P2T':<10s} {'STC':<8s} {'MWR':<8s}")
-    for m in methods:
-        r = all_results[m]
-        for grp, atks in [("known", KNOWN_ATTACKS), ("unseen", UNSEEN_ATTACKS)]:
-            row = f"{m:<12s} {grp:<8s}"
-            for a in ["TOH", "TIH", "BPH-T2P", "BPH-P2T", "STC", "MWR"]:
-                if a in r[grp]:
-                    mean_asr = np.mean([b["asr"] for b in r[grp][a]])
-                    row += f" {mean_asr:.3f}  "
-                else:
-                    row += f" {'--':<8s}"
-            print(row)
+    args = ap.parse_args()
+    {"make_pool": cmd_make_pool, "train": cmd_train, "eval": cmd_eval}[args.cmd](args)
 
 
 if __name__ == "__main__":
