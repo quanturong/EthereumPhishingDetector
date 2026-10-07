@@ -161,10 +161,8 @@ class GATv2Model(nn.Module):
 
 class PEAEGNNModel(nn.Module):
     """
-    Xap xi PEAE-GNN [1] (KHONG phai ban tai lap goc):
-      - SAGE encoder tren ego-graph
-      - Target-node embedding + graph readout (mean+max)
-      - "augmentation" thay bang feature-level dropout khi train
+    Phien ban cu (giu lai de reproduce ket qua Stage 5-7 da chay):
+      SAGE encoder + target emb + mean/max pool + feature dropout.
     """
     def __init__(self, in_dim, hid=64, num_layers=2, dropout=0.3):
         super().__init__()
@@ -191,10 +189,132 @@ class PEAEGNNModel(nn.Module):
         return self.head(torch.cat([target_emb, g_mean, g_max], dim=1))
 
 
+class PEAEGNNv2(nn.Module):
+    """
+    PEAE-GNN v2 - gan voi paper goc hon [Huang et al. 2024]:
+      1. Augmented Ego-Graph (AEG): random edge drop + feature mask (bao toan target).
+      2. Target-centric attention aggregation (GAT-based encoder).
+      3. Multi-scale target embedding: concat target_emb o tung layer.
+      4. Target-as-query attention readout: target attends toan graph.
+      5. Projection head cho contrastive loss (NT-Xent giua 2 augmented views).
+
+    Call forward(data) -> logits (inference OR classification during train).
+    Call forward(data, return_aug=True) -> (logits, proj1, proj2) de tinh contrastive loss.
+    """
+    def __init__(self, in_dim, hid=64, num_layers=2, heads=4, dropout=0.3,
+                 edge_drop=0.2, feat_mask=0.15):
+        super().__init__()
+        from torch_geometric.utils import dropout_edge, softmax as geo_softmax
+        from torch_geometric.nn import global_add_pool
+        self._dropout_edge = dropout_edge
+        self._geo_softmax = geo_softmax
+        self._global_add_pool = global_add_pool
+
+        self.heads = heads
+        self.hid = hid
+        self.num_layers = num_layers
+        self.dropout = dropout
+        self.edge_drop = edge_drop
+        self.feat_mask = feat_mask
+        self.enc_dim = hid * heads  # output dim after concat heads
+
+        # Target-aware encoder: GATv2 (attention-based)
+        self.convs = nn.ModuleList()
+        self.convs.append(GATv2Conv(in_dim, hid, heads=heads, concat=True, dropout=dropout))
+        for _ in range(num_layers - 1):
+            self.convs.append(GATv2Conv(self.enc_dim, hid, heads=heads, concat=True, dropout=dropout))
+
+        # Target-centric attention readout (target as query, all nodes as key/value)
+        self.attn_q = nn.Linear(self.enc_dim, hid)
+        self.attn_k = nn.Linear(self.enc_dim, hid)
+        self.attn_v = nn.Linear(self.enc_dim, hid)
+
+        # Readout: multi-scale target + mean + max + attention readout
+        readout_dim = num_layers * self.enc_dim + 2 * self.enc_dim + hid
+        self.head = nn.Sequential(
+            nn.Linear(readout_dim, hid), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(hid, hid // 2), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(hid // 2, 2),
+        )
+
+        # Projection head cho contrastive loss
+        self.proj = nn.Sequential(
+            nn.Linear(self.enc_dim, hid), nn.ReLU(),
+            nn.Linear(hid, hid // 2),
+        )
+
+    def _augment(self, x, edge_index, target_mask):
+        """AEG: random edge drop + feature mask (bao toan target node)."""
+        mask = torch.bernoulli(torch.full_like(x, 1 - self.feat_mask))
+        mask[target_mask] = 1.0
+        x_aug = x * mask
+        edge_index_aug, _ = self._dropout_edge(edge_index, p=self.edge_drop, training=True)
+        return x_aug, edge_index_aug
+
+    def _encode(self, x, edge_index):
+        """Return (final_x, list of per-layer x)."""
+        xs = []
+        for conv in self.convs:
+            x = F.elu(conv(x, edge_index))
+            x = F.dropout(x, p=self.dropout, training=self.training)
+            xs.append(x)
+        return x, xs
+
+    def _target_attn_readout(self, x, batch, target_mask):
+        """Target-as-query attention: target attends over all nodes in its graph."""
+        q_tgt = self.attn_q(x[target_mask])         # [B, hid]
+        q = q_tgt[batch]                             # [N, hid] broadcast
+        k = self.attn_k(x)                           # [N, hid]
+        v = self.attn_v(x)                           # [N, hid]
+        scores = (q * k).sum(dim=-1) / (self.hid ** 0.5)  # [N]
+        attn = self._geo_softmax(scores, batch)      # [N]
+        return self._global_add_pool(attn.unsqueeze(-1) * v, batch)  # [B, hid]
+
+    def _forward_graph(self, x, ei, batch, tm):
+        """Return readout vector + per-layer target embeddings."""
+        x_final, xs = self._encode(x, ei)
+        tgt_per_layer = [xl[tm] for xl in xs]        # list of [B, enc_dim]
+        multi_scale_tgt = torch.cat(tgt_per_layer, dim=1)  # [B, L*enc_dim]
+        g_mean = global_mean_pool(x_final, batch)
+        g_max  = global_max_pool(x_final, batch)
+        attn_r = self._target_attn_readout(x_final, batch, tm)
+        g = torch.cat([multi_scale_tgt, g_mean, g_max, attn_r], dim=1)
+        return g, tgt_per_layer[-1]
+
+    def forward(self, data, return_aug=False):
+        x, ei, batch, tm = data.x, data.edge_index, data.batch, data.target_mask
+        g, tgt_final = self._forward_graph(x, ei, batch, tm)
+        logits = self.head(g)
+        if not return_aug or not self.training:
+            return logits
+        # AEG: two augmented views for contrastive loss
+        x1, ei1 = self._augment(x, ei, tm)
+        x2, ei2 = self._augment(x, ei, tm)
+        _, tgt1 = self._forward_graph(x1, ei1, batch, tm)
+        _, tgt2 = self._forward_graph(x2, ei2, batch, tm)
+        proj1 = self.proj(tgt1)
+        proj2 = self.proj(tgt2)
+        return logits, proj1, proj2
+
+
+def peae_contrastive_loss(proj1, proj2, temperature=0.5):
+    """NT-Xent (SimCLR style): same-graph different-view = positive, else negative."""
+    proj1 = F.normalize(proj1, dim=1)
+    proj2 = F.normalize(proj2, dim=1)
+    B = proj1.size(0)
+    all_proj = torch.cat([proj1, proj2], dim=0)             # [2B, D]
+    sim = (all_proj @ all_proj.T) / temperature             # [2B, 2B]
+    mask_self = torch.eye(2 * B, device=sim.device).bool()
+    sim = sim.masked_fill(mask_self, -1e9)
+    labels = torch.cat([torch.arange(B, 2 * B), torch.arange(0, B)]).to(sim.device)
+    return F.cross_entropy(sim, labels)
+
+
 MODELS = {
     "graphsage": GraphSAGEModel,
     "gatv2":     GATv2Model,
-    "peaegnn":   PEAEGNNModel,
+    "peaegnn":   PEAEGNNModel,     # phien ban cu, giu de backward-compat
+    "peaegnnv2": PEAEGNNv2,        # phien ban moi, gan paper goc hon
 }
 
 
@@ -245,6 +365,10 @@ def train_one(model_name: str, train_ds, val_ds, test_ds, in_dim: int,
     best_val, best_epoch, wait = -1.0, 0, 0
     best_state, hist = None, []
 
+    # Contrastive loss weight cho peaegnnv2 (AEG + NT-Xent).
+    is_peae_v2 = (model_name == "peaegnnv2")
+    alpha_contrastive = 0.1
+
     for ep in range(1, epochs + 1):
         t0 = time.time()
         model.train()
@@ -252,7 +376,13 @@ def train_one(model_name: str, train_ds, val_ds, test_ds, in_dim: int,
         for batch in train_loader:
             batch = batch.to(device)
             opt.zero_grad()
-            loss = F.cross_entropy(model(batch), batch.y, weight=cw)
+            if is_peae_v2:
+                logits, proj1, proj2 = model(batch, return_aug=True)
+                ce = F.cross_entropy(logits, batch.y, weight=cw)
+                cont = peae_contrastive_loss(proj1, proj2)
+                loss = ce + alpha_contrastive * cont
+            else:
+                loss = F.cross_entropy(model(batch), batch.y, weight=cw)
             loss.backward()
             opt.step()
             total_loss += float(loss) * batch.num_graphs
