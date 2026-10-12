@@ -111,30 +111,30 @@ def _gp(rng, pool):
 
 
 # --- Attacks: tra ve (new_txs, vi_do_ke_tan_cong_kiem_soat) -------------------
-def attack_toh(raw, target, b, rng, pool, **_):
+def attack_toh(raw, target, b, rng, pool, w0=0, **_):
     t0, new, wal = _last_ts(raw) + 3600, [], set()
     for i in range(b):
-        peer = _fake_wallet(target, i); wal.add(peer)
+        peer = _fake_wallet(target, i + w0); wal.add(peer)
         val = int(rng.uniform(1e15, 1e16))
         ts = t0 + i * 600 + int(rng.integers(0, 300))
         new.append(_mk_tx(target, peer, val, ts, _gp(rng, pool)))
     return new, wal
 
 
-def attack_tih(raw, target, b, rng, pool, **_):
+def attack_tih(raw, target, b, rng, pool, w0=0, **_):
     t0, new, wal = _last_ts(raw) + 3600, [], set()
     for i in range(b):
-        peer = _fake_wallet(target, i + 10_000); wal.add(peer)
+        peer = _fake_wallet(target, i + 10_000 + w0); wal.add(peer)
         val = int(rng.uniform(1e15, 1e16))
         ts = t0 + i * 600 + int(rng.integers(0, 300))
         new.append(_mk_tx(peer, target, val, ts, _gp(rng, pool)))
     return new, wal
 
 
-def attack_bph_t2p(raw, target, b, rng, pool, **_):
+def attack_bph_t2p(raw, target, b, rng, pool, w0=0, **_):
     t0, new, wal = _last_ts(raw) + 3600, [], set()
     for i in range(b):
-        w1 = _fake_wallet(target, i + 20_000); pert = _fake_wallet(target, i + 30_000)
+        w1 = _fake_wallet(target, i + 20_000 + w0); pert = _fake_wallet(target, i + 30_000 + w0)
         wal |= {w1, pert}
         val = int(rng.uniform(1e15, 1e16))
         ts1 = t0 + i * 1200
@@ -144,10 +144,10 @@ def attack_bph_t2p(raw, target, b, rng, pool, **_):
     return new, wal
 
 
-def attack_bph_p2t(raw, target, b, rng, pool, **_):
+def attack_bph_p2t(raw, target, b, rng, pool, w0=0, **_):
     t0, new, wal = _last_ts(raw) + 3600, [], set()
     for i in range(b):
-        pert = _fake_wallet(target, i + 40_000); w1 = _fake_wallet(target, i + 50_000)
+        pert = _fake_wallet(target, i + 40_000 + w0); w1 = _fake_wallet(target, i + 50_000 + w0)
         wal |= {w1, pert}
         val = int(rng.uniform(1e15, 1e16))
         ts1 = t0 + i * 1200
@@ -157,25 +157,25 @@ def attack_bph_p2t(raw, target, b, rng, pool, **_):
     return new, wal
 
 
-def attack_stc(raw, target, b, rng, pool, **_):
+def attack_stc(raw, target, b, rng, pool, w0=0, hv=False, **_):
     """Split-and-Temporal Camouflage: b*4 tx nho target -> 1 vi camouflage, rai 30 ngay."""
     k, span = 4, 30 * 24 * 3600
     t0, new = _last_ts(raw) + 3600, []
-    camo = _fake_wallet(target, 60_000)
+    camo = _fake_wallet(target, 60_000 + w0)
     total = b * k
     for i in range(total):
-        val = int(rng.uniform(1e14, 5e14))
+        val = int(10 ** rng.uniform(16, 18)) if hv else int(rng.uniform(1e14, 5e14))
         ts = t0 + int((i / max(total - 1, 1)) * span)
         new.append(_mk_tx(target, camo, val, ts, _gp(rng, pool)))
     return new, {camo}
 
 
-def attack_mwr(raw, target, b, rng, pool, **_):
+def attack_mwr(raw, target, b, rng, pool, w0=0, **_):
     """Multi-Wallet Routing (round-trip): target -> W1 -> W2 -> target (3 tx / budget)."""
     t0, new, wal = _last_ts(raw) + 3600, [], set()
     for i in range(b):
-        w1 = _fake_wallet(target, i + 70_000)
-        w2 = _fake_wallet(target, i + 80_000)
+        w1 = _fake_wallet(target, i + 70_000 + w0)
+        w2 = _fake_wallet(target, i + 80_000 + w0)
         wal |= {w1, w2}
         val = int(rng.uniform(1e15, 1e16))
         ts1 = t0 + i * 1800
@@ -187,120 +187,230 @@ def attack_mwr(raw, target, b, rng, pool, **_):
     return new, wal
 
 
-# --- Attacks moi (Huong C: Adaptive-STC, D: Combined) ------------------------
-def attack_adaptive_stc(raw, target, b, rng, pool, **ctx):
+# --- Tan cong moi ------------------------------------------------------------
+def attack_adaptive_stc(raw, target, b, rng, pool, w0=0, low_value=False, **_):
     """
-    Adaptive-STC: ca bang in/out, value theo phan bo normal (log-uniform 0.01-1 ETH),
-    rai qua 90 ngay. Chen ca 2 chieu de day phan bo in/out cua target ve trung tam normal.
+    Adaptive-STC: b*6 tx nho, value log-uniform 0.01-1 ETH, rai 90 ngay, tu can bang chieu
+    (target nhan nhieu hon gui -> them tx GUI DI; nguoc lai -> them tx NHAN VAO).
     """
     k, span = 6, 90 * 24 * 3600
-    t0, new, wal = _last_ts(raw) + 3600, [], set()
-    camo_in = _fake_wallet(target, 100_000)
-    camo_out = _fake_wallet(target, 100_001)
-    wal |= {camo_in, camo_out}
-
+    t0, new = _last_ts(raw) + 3600, []
+    camo_in = _fake_wallet(target, 100_000 + w0)
+    camo_out = _fake_wallet(target, 100_001 + w0)
     t_lc = target.lower()
     in_count = sum(1 for t in raw if (t.get("to") or "").lower() == t_lc)
     out_count = sum(1 for t in raw if (t.get("from") or "").lower() == t_lc)
-
     total = b * k
     for i in range(total):
-        val = int(10 ** rng.uniform(16, 18))     # 0.01-1 ETH log-uniform
+        val = int(rng.uniform(1e14, 5e14)) if low_value else int(10 ** rng.uniform(16, 18))
         ts = t0 + int((i / max(total - 1, 1)) * span)
         if in_count > out_count:
-            new.append(_mk_tx(target, camo_out, val, ts, _gp(rng, pool)))
-            out_count += 1
+            new.append(_mk_tx(target, camo_out, val, ts, _gp(rng, pool))); out_count += 1
         else:
-            new.append(_mk_tx(camo_in, target, val, ts, _gp(rng, pool)))
-            in_count += 1
+            new.append(_mk_tx(camo_in, target, val, ts, _gp(rng, pool))); in_count += 1
+    return new, {camo_in, camo_out}
+
+
+def _combined_split(b):
+    b_stc = int(round(0.5 * b)); b_bph = int(round(0.3 * b))
+    return b - b_stc - b_bph, b_stc, b_bph          # (TOH, STC, BPH-T2P); co the = 0
+
+
+def attack_combined(raw, target, b, rng, pool, w0=0, **_):
+    """Ket hop: ~50% STC + ~30% BPH-T2P + ~20% TOH (tinh theo don vi ngan sach, co the = 0)."""
+    b_toh, b_stc, b_bph = _combined_split(b)
+    r = [np.random.default_rng(int(rng.integers(0, 2 ** 31))) for _ in range(3)]
+    new, wal = [], set()
+    for fn, bb, rr in ((attack_toh, b_toh, r[0]), (attack_stc, b_stc, r[1]), (attack_bph_t2p, b_bph, r[2])):
+        if bb > 0:
+            t, w = fn(raw, target, bb, rr, pool, w0=w0)
+            new += t; wal |= w
     return new, wal
 
 
-def attack_combined(raw, target, b, rng, pool, **ctx):
+def attack_greedy_query(raw, target, b, rng, pool, model=None, stats=None, device="cpu",
+                        cache=None, build_fn=None, n_cands=4, w0=0, **_):
     """
-    Multi-strategy: 50% STC + 30% BPH-T2P + 20% TOH trong cung ngan sach.
-    Realistic attacker ket hop nhieu motif.
+    GREEDY-QUERY (KHONG phai gradient): moi buoc thu n_cands motif ngau nhien (moi motif
+    ngan sach 1, vi MOI buoc khac nhau), hoi MO HINH BI TAN CONG, giu motif lam P(phishing)
+    giam nhieu nhat. Dung som khi (a) da lat (P<0.5) hoac (b) khong motif nao lam P giam.
+    Phai danh gia RIENG voi tung mo hinh (ke tan cong thich ung theo mo hinh do).
     """
-    b_stc = max(1, b // 2)
-    b_bph = max(1, (b * 3) // 10)
-    b_toh = max(1, b - b_stc - b_bph)
-    rng1, rng2, rng3 = (np.random.default_rng(int(rng.integers(0, 2**31))) for _ in range(3))
+    if model is None or build_fn is None or cache is None or stats is None:
+        raise ValueError("GREEDY-QUERY can model, stats, cache, build_fn")
+    motifs = ["TOH", "TIH", "STC", "BPH-T2P", "BPH-P2T", "MWR"]
 
-    toh_txs, toh_w = attack_toh(raw, target, b_toh, rng1, pool)
-    stc_txs, stc_w = attack_stc(raw, target, b_stc, rng2, pool)
-    bph_txs, bph_w = attack_bph_t2p(raw, target, b_bph, rng3, pool)
+    def prob(txs):
+        g = build_fn(cache, txs if txs else None)
+        if g is None:
+            return None
+        batch = Batch.from_data_list([to_pyg(g, stats)]).to(device)
+        with torch.no_grad():
+            return float(F.softmax(model(batch), dim=1)[0, 1].item())
 
-    return toh_txs + stc_txs + bph_txs, toh_w | stc_w | bph_w
-
-
-def attack_gradient_greedy(raw, target, b, rng, pool, **ctx):
-    """
-    Huong B: greedy whitebox - moi buoc chon motif + budget=1 ma giam P(phishing) manh nhat.
-    Can ctx = {model, stats, device, cache, build_fn}. Khong co ctx -> fallback COMBINED.
-    """
-    model = ctx.get("model")
-    stats = ctx.get("stats")
-    device = ctx.get("device", "cpu")
-    cache = ctx.get("cache")
-    build_fn = ctx.get("build_fn")
-    if model is None or build_fn is None or cache is None:
-        return attack_combined(raw, target, b, rng, pool)
-
-    base_motifs = ["TOH", "TIH", "STC", "BPH-T2P", "BPH-P2T", "MWR"]
-    accepted_txs = []
-    accepted_wal = set()
-    n_tried_per_step = 4   # so motif try moi buoc (speed-vs-strength)
-
+    acc, wal = [], set()
+    cur = prob([])
     for step in range(b):
-        best_txs, best_wal, best_p = None, None, 1.0
-        for _ in range(n_tried_per_step):
-            atk = base_motifs[int(rng.integers(0, len(base_motifs)))]
+        if cur is None or cur < 0.5:
+            break
+        best = None
+        for _ in range(n_cands):
+            atk = motifs[int(rng.integers(0, len(motifs)))]
+            ct, cw = ATTACKS[atk](raw + acc, target, 1,
+                                  np.random.default_rng(int(rng.integers(0, 2 ** 31))),
+                                  pool, w0=(step + 1) * 10)
+            pv = prob(acc + ct)
+            if pv is not None and (best is None or pv < best[0]):
+                best = (pv, ct, cw)
+        if best is None or best[0] >= cur:
+            break
+        cur, acc, wal = best[0], acc + best[1], wal | best[2]
+    return acc, wal
+
+
+def attack_stc_hv(raw, target, b, rng, pool, **kw):
+    """STC y het ban goc (4 tx/don vi, 30 ngay, 1 vi, chi gui di) nhung gia tri LON nhu ADAPTIVE-STC."""
+    return attack_stc(raw, target, b, rng, pool, hv=True, **kw)
+
+
+def attack_adaptive_stc_lv(raw, target, b, rng, pool, **kw):
+    """ADAPTIVE-STC y het (6 tx/don vi, 90 ngay, can bang chieu) nhung gia tri NHO nhu STC goc."""
+    return attack_adaptive_stc(raw, target, b, rng, pool, low_value=True, **kw)
+
+
+def _adaptive_stc_variant(raw, target, b_units, rng, pool, w0, params):
+    """
+    ADAPTIVE-STC voi tham so tuy chinh:
+      params = (dir_bias, value_log_lo, value_log_hi, span_days, k_txs_per_unit)
+    """
+    dir_bias, v_lo, v_hi, span_days, k = params
+    span = span_days * 24 * 3600
+    t0, new = _last_ts(raw) + 3600, []
+    camo_in = _fake_wallet(target, 100_000 + w0)
+    camo_out = _fake_wallet(target, 100_001 + w0)
+    t_lc = target.lower()
+    in_count = sum(1 for t in raw if (t.get("to") or "").lower() == t_lc)
+    out_count = sum(1 for t in raw if (t.get("from") or "").lower() == t_lc)
+    total = int(b_units * k)
+    for i in range(total):
+        val = int(10 ** rng.uniform(v_lo, v_hi))
+        ts = t0 + int((i / max(total - 1, 1)) * span)
+        # dir_bias in [-1, 1]: -1 = chi incoming, +1 = chi outgoing, 0 = balance
+        bias_prob = (dir_bias + 1) / 2  # map ve [0, 1]
+        force_out = rng.random() < bias_prob
+        want_out = force_out or (in_count > out_count and not force_out)
+        if want_out:
+            new.append(_mk_tx(target, camo_out, val, ts, _gp(rng, pool))); out_count += 1
+        else:
+            new.append(_mk_tx(camo_in, target, val, ts, _gp(rng, pool))); in_count += 1
+    return new, {camo_in, camo_out}
+
+
+def attack_defense_adaptive(raw, target, b, rng, pool, model=None, stats=None,
+                             device="cpu", cache=None, build_fn=None,
+                             n_cands=8, w0=0, **_):
+    """
+    DEFENSE-ADAPTIVE: dung ADAPTIVE-STC motif lam base, moi buoc search param space
+    (dir_bias, value_scale, time_span) qua n_cands=8 candidates, pick candidate lam
+    P(phishing) giam nhieu nhat. Khac GREEDY-QUERY o cho:
+      1. Base motif: ADAPTIVE-STC (manh 50% ASR vs basic 2-3%)
+      2. Search parameter: dir_bias, value_log range, time span
+      3. Multi-scale budget: 1-3 units per step tuy giai doan
+      4. Early stop khi P(phish) < 0.3
+
+    Can model, stats, device, cache, build_fn. Dung voi mo hinh phong thu (RA-SAGE,
+    AdvTrain) de do do ben truoc tan cong thich ung.
+    """
+    if model is None or build_fn is None or cache is None or stats is None:
+        raise ValueError("DEFENSE-ADAPTIVE can model, stats, cache, build_fn")
+
+    def prob(txs):
+        g = build_fn(cache, txs if txs else None)
+        if g is None:
+            return None
+        batch = Batch.from_data_list([to_pyg(g, stats)]).to(device)
+        with torch.no_grad():
+            return float(F.softmax(model(batch), dim=1)[0, 1].item())
+
+    # Param space: (dir_bias, value_log_lo, value_log_hi, span_days, k)
+    param_grid = [
+        ( 0.0, 16, 18, 90, 6),   # ADAPTIVE-STC default
+        ( 0.0, 14, 15, 90, 6),   # ADAPTIVE-STC-LV
+        (-0.5, 16, 18, 90, 6),   # bias incoming
+        (+0.5, 16, 18, 90, 6),   # bias outgoing
+        ( 0.0, 16, 18, 30, 6),   # short span
+        ( 0.0, 16, 18, 180, 8),  # long span, more txs
+        ( 0.0, 15, 17, 60, 4),   # smaller motif
+        ( 0.0, 17, 19, 90, 6),   # larger value
+    ][:n_cands]
+
+    acc, wal = [], set()
+    cur = prob([])
+    if cur is None:
+        return [], set()
+
+    # Chia budget: moi step = 1 unit (6 tx), stop khi het budget hoac flipped
+    for step in range(b):
+        if cur < 0.3:   # da flip rong rai, stop
+            break
+        best = None
+        for ci, params in enumerate(param_grid):
+            r_cand = np.random.default_rng(int(rng.integers(0, 2**31)))
             try:
-                cand_txs, cand_wal = ATTACKS[atk](
-                    raw + accepted_txs, target, 1,
-                    np.random.default_rng(int(rng.integers(0, 2**31))), pool,
+                cand_txs, cand_wal = _adaptive_stc_variant(
+                    raw + acc, target, 1, r_cand, pool,
+                    w0=(step + 1) * 100 + ci, params=params,
                 )
             except Exception:
                 continue
-            try:
-                g = build_fn(cache, accepted_txs + cand_txs)
-                if g is None:
-                    continue
-                pyg = to_pyg(g, stats)
-                batch = Batch.from_data_list([pyg]).to(device)
-                with torch.no_grad():
-                    p = float(F.softmax(model(batch), dim=1)[0, 1].item())
-            except Exception:
-                continue
-            if p < best_p:
-                best_p, best_txs, best_wal = p, cand_txs, cand_wal
-        if best_txs:
-            accepted_txs.extend(best_txs)
-            accepted_wal |= best_wal
-    return accepted_txs, accepted_wal
+            pv = prob(acc + cand_txs)
+            if pv is not None and (best is None or pv < best[0]):
+                best = (pv, cand_txs, cand_wal)
+        if best is None or best[0] >= cur - 1e-4:
+            break   # khong candidate nao giam P -> stop
+        cur, acc, wal = best[0], acc + best[1], wal | best[2]
+    return acc, wal
 
 
+BASE_ATTACKS = ["TOH", "TIH", "BPH-T2P", "BPH-P2T", "STC", "MWR"]
 ATTACKS = {
     "TOH": attack_toh, "TIH": attack_tih,
     "BPH-T2P": attack_bph_t2p, "BPH-P2T": attack_bph_p2t,
     "STC": attack_stc, "MWR": attack_mwr,
-    "ADAPTIVE-STC": attack_adaptive_stc,
-    "COMBINED":     attack_combined,
-    "GRADIENT":     attack_gradient_greedy,
+    "ADAPTIVE-STC": attack_adaptive_stc, "COMBINED": attack_combined,
+    "GREEDY-QUERY": attack_greedy_query,
+    "STC-HV": attack_stc_hv, "ADAPTIVE-STC-LV": attack_adaptive_stc_lv,   # ablation gia tri
+    "DEFENSE-ADAPTIVE": attack_defense_adaptive,   # white-box adaptive to defense model
 }
-# TXS_PER_UNIT dung de tinh AMT (so tx thuc te) va validate budget.
-# COMBINED/GRADIENT co so tx bien thien theo cach split -> set thanh 0 de validator bo qua check "budget".
-TXS_PER_UNIT = {
-    "TOH": 1, "TIH": 1, "BPH-T2P": 2, "BPH-P2T": 2, "STC": 4, "MWR": 3,
-    "ADAPTIVE-STC": 6, "COMBINED": 0, "GRADIENT": 0,
-}
+# Chi so co dinh cua tung tan cong (de seed ngau nhien KHONG doi khi doi thu tu/tap --attacks)
+ATTACK_IDS = {n: i for i, n in enumerate(ATTACKS)}
+TXS_PER_UNIT = {"TOH": 1, "TIH": 1, "BPH-T2P": 2, "BPH-P2T": 2, "STC": 4, "MWR": 3, "ADAPTIVE-STC": 6,
+                "STC-HV": 4, "ADAPTIVE-STC-LV": 6,
+                "DEFENSE-ADAPTIVE": 6}  # trung binh 6 tx/budget (ADAPTIVE-STC motif)
+
+
+def _tx_cost_eth(new):
+    """(tong gia tri chuyen, tong phi gas) cua cac tx gia, don vi ETH. Gia tri CONG DON qua moi tx
+    (tien chay qua nhieu chang duoc dem nhieu lan) -> KHONG phai von toi thieu can co."""
+    val = sum(int(t["value"]) for t in new) / 1e18
+    gas = sum(int(t["gasPrice"]) * int(t["gasUsed"]) for t in new) / 1e18
+    return val, gas
+
+
+def expected_txs(atk, b):
+    """So tx ky vong de kiem tra ngan sach; None = khong kiem tra (so tx bien thien)."""
+    if atk == "COMBINED":
+        t, s_, p_ = _combined_split(b)
+        return t + 4 * s_ + 2 * p_
+    if atk in ("GREEDY-QUERY", "DEFENSE-ADAPTIVE"):
+        return None   # so tx bien thien theo early-stop
+    return b * TXS_PER_UNIT[atk]
 
 
 def validate_new_txs(new_txs, wallets, target, last_real_ts, t_end, n_expected):
-    """Tra ve danh sach loi (rong = hop le). Khong kiem tra so du / chi phi gas.
-    n_expected = 0: bo qua kiem tra budget (dung cho COMBINED/GRADIENT - so tx bien thien)."""
+    """Tra ve danh sach loi (rong = hop le). Khong kiem tra so du / chi phi gas."""
     errs = []
-    if n_expected > 0 and len(new_txs) != n_expected:
+    if n_expected is not None and len(new_txs) != n_expected:
         errs.append("budget")
     ok_ends = {target} | wallets
     for t in new_txs:
@@ -346,11 +456,38 @@ def build_graph(c: TargetCache, new_txs=None):
 
 @torch.no_grad()
 def predict_graphs(model, graphs, stats, device, bs=16):
+    """OOM-safe: catch RuntimeError, fallback bs/4 roi bs=1 cho batch problematic."""
+    import gc
     model.eval()
     out = []
-    for i in range(0, len(graphs), bs):
-        batch = Batch.from_data_list([to_pyg(g, stats) for g in graphs[i:i + bs]]).to(device)
-        out.append(F.softmax(model(batch), dim=1)[:, 1].cpu().numpy())
+    i = 0
+    while i < len(graphs):
+        chunk = graphs[i:i + bs]
+        try:
+            batch = Batch.from_data_list([to_pyg(g, stats) for g in chunk]).to(device)
+            probs = F.softmax(model(batch), dim=1)[:, 1].cpu().numpy()
+            out.append(probs)
+            i += bs
+        except RuntimeError as e:
+            if 'memory' not in str(e).lower():
+                raise
+            # OOM: free + fallback bs=1 cho chunk nay
+            gc.collect()
+            import torch
+            if hasattr(torch, 'cuda') and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            print(f"  [OOM at i={i}, bs={bs}] fallback to bs=1 for {len(chunk)} graphs", flush=True)
+            for g in chunk:
+                try:
+                    b1 = Batch.from_data_list([to_pyg(g, stats)]).to(device)
+                    p = F.softmax(model(b1), dim=1)[:, 1].cpu().numpy()
+                    out.append(p)
+                except RuntimeError as e2:
+                    if 'memory' not in str(e2).lower():
+                        raise
+                    print(f"  [SKIP graph (OOM even bs=1): {g.get('target', '?')[:10]}]", flush=True)
+                    out.append(np.array([0.5]))  # neutral prob
+            i += bs
     return np.concatenate(out)
 
 
@@ -364,7 +501,9 @@ def main():
     ap.add_argument("--model", choices=list(MODELS), default="peaegnn")
     ap.add_argument("--ckpt_seed", type=int, default=42, help="seed cua checkpoint Stage 5")
     ap.add_argument("--budgets", nargs="+", type=int, default=[1, 3, 5, 10, 20])
-    ap.add_argument("--attacks", nargs="+", default=list(ATTACKS), choices=list(ATTACKS) + ["all"])
+    ap.add_argument("--attacks", nargs="+", default=BASE_ATTACKS, choices=list(ATTACKS) + ["all"],
+                    help="mac dinh: 6 tan cong goc. GREEDY-QUERY rat cham (hoi mo hinh nhieu lan)")
+    ap.add_argument("--greedy_cands", type=int, default=4, help="so motif thu moi buoc cua GREEDY-QUERY")
     ap.add_argument("--seed", type=int, default=42, help="seed sinh tan cong")
     ap.add_argument("--max_targets", type=int, default=0, help="0 = tat ca; >0 de chay thu")
     ap.add_argument("--verify", type=int, default=0, help="doi chieu N graph voi pkl 9c (nap pkl 4 GB)")
@@ -424,6 +563,8 @@ def main():
     y_all, clean_prob = [], []
     phish_pos = {}          # chi so trong danh sach phishing
     atk_prob = {a: {b: [] for b in args.budgets} for a in args.attacks}
+    atk_ntx = {a: {b: [] for b in args.budgets} for a in args.attacks}   # so tx THUC TE da them
+    atk_cost = {a: {b: [] for b in args.budgets} for a in args.attacks}  # (value ETH, gas ETH)
     n_skipped, violations = 0, 0
     t_start = time.time()
     for _, row in tqdm(test.iterrows(), total=len(test), unit="tgt"):
@@ -436,15 +577,15 @@ def main():
         graphs, tags = [g0], [("clean", 0)]
         if label == 1:
             last_real = _last_ts(c.txs)
-            atk_ctx = {"model": model, "stats": stats, "device": device,
-                       "cache": c, "build_fn": build_graph}
-            for ai, atk in enumerate(args.attacks):
+            ctx = {"model": model, "stats": stats, "device": device, "cache": c,
+                   "build_fn": build_graph, "n_cands": args.greedy_cands}
+            for atk in args.attacks:
                 for b in args.budgets:
-                    new, wal = ATTACKS[atk](c.txs, addr, b,
-                                            _atk_rng(args.seed, addr, ai, b),
-                                            c.pool, **atk_ctx)
-                    expected_n = b * TXS_PER_UNIT[atk]  # 0 cho COMBINED/GRADIENT -> skip budget check
-                    errs = validate_new_txs(new, wal, addr, last_real, t_end, expected_n)
+                    new, wal = ATTACKS[atk](c.txs, addr, b, _atk_rng(args.seed, addr, ATTACK_IDS[atk], b),
+                                            c.pool, **ctx)
+                    atk_ntx[atk][b].append(len(new))
+                    atk_cost[atk][b].append(_tx_cost_eth(new))
+                    errs = validate_new_txs(new, wal, addr, last_real, t_end, expected_txs(atk, b))
                     if errs:
                         violations += 1
                         print(f"  [INVALID] {addr[:10]} {atk} b={b}: {errs}")
@@ -478,6 +619,7 @@ def main():
     any_flip = np.zeros(n_ph, dtype=bool)   # lat boi IT NHAT 1 (tan cong, ngan sach)
     for atk in args.attacks:
         per_b, min_b = [], np.full(n_ph, np.inf)
+        amt_first = np.full(n_ph, np.nan)
         for b in args.budgets:
             ap_ = np.array(atk_prob[atk][b]) >= 0.5
             flipped = correct & ~ap_
@@ -485,14 +627,20 @@ def main():
             asr = float(flipped.sum() / max(n_correct, 1))
             pred = cpred.copy(); pred[ph] = ap_.astype(int)
             rmf1 = float(f1_score(y, pred, average="macro", zero_division=0))
-            min_b = np.where(flipped & (min_b == np.inf), b, min_b)
+            first = flipped & ~np.isfinite(min_b)
+            ntx_b = np.array(atk_ntx[atk][b], dtype=float)
+            amt_first[first] = ntx_b[first]
+            min_b = np.where(first, b, min_b)
             p_att = np.array(atk_prob[atk][b])
-            per_b.append({"budget": b, "amt": b * TXS_PER_UNIT[atk], "asr": asr,
+            cst = np.array(atk_cost[atk][b], dtype=float).reshape(-1, 2)
+            per_b.append({"budget": b, "amt": float(ntx_b.mean()) if len(ntx_b) else None, "asr": asr,
+                          "mean_value_eth": float(cst[:, 0].mean()) if len(cst) else None,
+                          "mean_gas_eth": float(cst[:, 1].mean()) if len(cst) else None,
                           "mean_p_phish_attacked": float(p_att.mean()) if len(p_att) else None,
                           "robust_recall": float(ap_.sum() / max(n_ph, 1)), "robust_macro_f1": rmf1,
                           "n_flipped": int(flipped.sum()), "n_correct_clean": n_correct})
         flipped_any = np.isfinite(min_b)
-        amt_to_flip = float(np.mean(min_b[flipped_any]) * TXS_PER_UNIT[atk]) if flipped_any.any() else None
+        amt_to_flip = float(np.nanmean(amt_first[flipped_any])) if flipped_any.any() else None
         results["attacks"][atk] = {"budgets": per_b, "frac_flipped_any_budget": float(flipped_any.sum() / max(n_correct, 1)),
                                    "mean_amt_to_flip": amt_to_flip}
 
@@ -514,6 +662,11 @@ def main():
     for atk in args.attacks:
         print(f"{atk:<10s}" + "".join(f"{x['mean_p_phish_attacked']:>9.3f}"
                                       for x in results["attacks"][atk]["budgets"]))
+    print(f"\n{'='*70}\n Chi phi trung binh / mau o ngan sach lon nhat (b={args.budgets[-1]})\n{'='*70}")
+    print(f"{'Attack':<14s}{'so tx':>9s}{'value ETH':>12s}{'gas ETH':>11s}")
+    for atk in args.attacks:
+        x = results["attacks"][atk]["budgets"][-1]
+        print(f"{atk:<14s}{x['amt']:>9.1f}{x['mean_value_eth']:>12.3f}{x['mean_gas_eth']:>11.4f}")
     print(f"\nASR_any (lat boi it nhat 1 tan cong/ngan sach): {results['asr_any']:.3f} "
           f"({results['n_flipped_any']}/{n_correct})")
     print(f"\nSaved -> {out}")
