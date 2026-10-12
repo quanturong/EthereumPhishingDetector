@@ -273,6 +273,132 @@ def attack_stc_hv(raw, target, b, rng, pool, **kw):
     return attack_stc(raw, target, b, rng, pool, hv=True, **kw)
 
 
+def load_normal_templates(normal_hop1_dir, split_df, n_sample=100, seed=42,
+                           max_tx=1500, min_tx=10):
+    """
+    Nap mau cac vi normal lam template cho MIMICRY.
+    Chi lay vi trong tap TRAIN de tranh ro ri thong tin test.
+    Moi template co: in/out counts, value mean/std vao/ra, time span, so partner,
+    chuoi txs thuc te de lay mau timestamp pattern.
+    """
+    rng = np.random.default_rng(seed)
+    # Chi lay normal addresses tu TRAIN
+    normal_train = split_df[(split_df['label'] == 0) &
+                             (split_df['partition'] == 'train')]['address'].str.lower().tolist()
+    if not normal_train:
+        return []
+    sample = rng.choice(normal_train, size=min(n_sample * 3, len(normal_train)),
+                        replace=False).tolist()
+    templates = []
+    for addr in sample:
+        f = Path(normal_hop1_dir) / f"{addr}.json"
+        if not f.exists() or f.stat().st_size <= 2:
+            continue
+        try:
+            txs = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if len(txs) < min_tx or len(txs) > max_tx:
+            continue
+        a_lc = addr
+        in_vals = [int(t.get("value", 0) or 0) for t in txs
+                   if (t.get("to") or "").lower() == a_lc
+                   and int(t.get("value", 0) or 0) > 0]
+        out_vals = [int(t.get("value", 0) or 0) for t in txs
+                    if (t.get("from") or "").lower() == a_lc
+                    and int(t.get("value", 0) or 0) > 0]
+        timestamps = [int(t.get("timeStamp", 0) or 0) for t in txs if t.get("timeStamp")]
+        if len(in_vals) < 3 or len(out_vals) < 3 or len(timestamps) < 5:
+            continue
+        in_partners = {(t.get("from") or "").lower() for t in txs
+                       if (t.get("to") or "").lower() == a_lc}
+        out_partners = {(t.get("to") or "").lower() for t in txs
+                        if (t.get("from") or "").lower() == a_lc}
+        templates.append({
+            "address":      addr,
+            "in_count":     len(in_vals),
+            "out_count":    len(out_vals),
+            "in_val_log":   np.log10(np.array(in_vals, dtype=np.float64) + 1),
+            "out_val_log":  np.log10(np.array(out_vals, dtype=np.float64) + 1),
+            "time_span":    max(1, max(timestamps) - min(timestamps)),
+            "n_in_peers":   len(in_partners),
+            "n_out_peers":  len(out_partners),
+        })
+        if len(templates) >= n_sample:
+            break
+    return templates
+
+
+def attack_mimicry(raw, target, b, rng, pool, normal_templates=None, w0=0, **_):
+    """
+    MIMICRY: chon 1 normal address lam template, sinh tx de day feature cua target
+    ve gan template:
+      - Match in/out count ratio
+      - Sample value tu log-distribution cua template (mo phong value pattern)
+      - Rai timestamp theo time_span cua template
+      - Dung n_peers wallets de khong chi 2 partners
+    Can `normal_templates` list (do main nap san).
+
+    Moi budget unit = 6 tx (giong ADAPTIVE-STC). b=20 => ~120 tx.
+    """
+    if not normal_templates:
+        raise ValueError("MIMICRY can normal_templates (them vao ctx)")
+
+    # Chon template
+    tmpl = normal_templates[int(rng.integers(0, len(normal_templates)))]
+
+    # Dem feature hien tai cua target
+    t_lc = target.lower()
+    cur_in = sum(1 for t in raw if (t.get("to") or "").lower() == t_lc)
+    cur_out = sum(1 for t in raw if (t.get("from") or "").lower() == t_lc)
+
+    # Du lieu template
+    tgt_in, tgt_out = tmpl["in_count"], tmpl["out_count"]
+    span = min(tmpl["time_span"], 180 * 24 * 3600)   # cap 180 ngay
+    n_in_peers = max(2, min(tmpl["n_in_peers"], 20))
+    n_out_peers = max(2, min(tmpl["n_out_peers"], 20))
+
+    # Tinh so tx can them (clamp vao budget * 6)
+    total_budget = b * 6
+    diff_in = max(0, tgt_in - cur_in)
+    diff_out = max(0, tgt_out - cur_out)
+    if diff_in + diff_out == 0:
+        # target da co du tx -> chi them bang gui/nhan tu partners moi
+        diff_in = total_budget // 2
+        diff_out = total_budget - diff_in
+    scale = total_budget / max(diff_in + diff_out, 1)
+    n_add_in = min(int(diff_in * scale), total_budget)
+    n_add_out = total_budget - n_add_in
+
+    # Camouflage wallets (nhieu hon ADAPTIVE)
+    camo_ins = [_fake_wallet(target, 130_000 + w0 + i) for i in range(n_in_peers)]
+    camo_outs = [_fake_wallet(target, 140_000 + w0 + i) for i in range(n_out_peers)]
+
+    t0 = _last_ts(raw) + 3600
+    new = []
+
+    # Incoming txs
+    for i in range(n_add_in):
+        peer = camo_ins[int(rng.integers(0, len(camo_ins)))]
+        log_v = tmpl["in_val_log"][int(rng.integers(0, len(tmpl["in_val_log"])))]
+        val = max(1, int(10 ** log_v))
+        ts = t0 + int(rng.uniform(0, span))
+        new.append(_mk_tx(peer, target, val, ts, _gp(rng, pool)))
+
+    # Outgoing txs
+    for i in range(n_add_out):
+        peer = camo_outs[int(rng.integers(0, len(camo_outs)))]
+        log_v = tmpl["out_val_log"][int(rng.integers(0, len(tmpl["out_val_log"])))]
+        val = max(1, int(10 ** log_v))
+        ts = t0 + int(rng.uniform(0, span))
+        new.append(_mk_tx(target, peer, val, ts, _gp(rng, pool)))
+
+    # Sort txs by timestamp (realistic)
+    new.sort(key=lambda t: int(t["timeStamp"]))
+
+    return new, set(camo_ins) | set(camo_outs)
+
+
 def attack_adaptive_stc_lv(raw, target, b, rng, pool, **kw):
     """ADAPTIVE-STC y het (6 tx/don vi, 90 ngay, can bang chieu) nhung gia tri NHO nhu STC goc."""
     return attack_adaptive_stc(raw, target, b, rng, pool, low_value=True, **kw)
@@ -389,12 +515,14 @@ ATTACKS = {
     "GREEDY-QUERY": attack_greedy_query,
     "STC-HV": attack_stc_hv, "ADAPTIVE-STC-LV": attack_adaptive_stc_lv,   # ablation gia tri
     "DEFENSE-ADAPTIVE": attack_defense_adaptive,   # white-box adaptive to defense model
+    "MIMICRY": attack_mimicry,   # copy pattern cua 1 normal address lam template
 }
 # Chi so co dinh cua tung tan cong (de seed ngau nhien KHONG doi khi doi thu tu/tap --attacks)
 ATTACK_IDS = {n: i for i, n in enumerate(ATTACKS)}
 TXS_PER_UNIT = {"TOH": 1, "TIH": 1, "BPH-T2P": 2, "BPH-P2T": 2, "STC": 4, "MWR": 3, "ADAPTIVE-STC": 6,
                 "STC-HV": 4, "ADAPTIVE-STC-LV": 6,
-                "DEFENSE-ADAPTIVE": 6}  # trung binh 6 tx/budget (ADAPTIVE-STC motif)
+                "DEFENSE-ADAPTIVE": 6,  # trung binh 6 tx/budget (ADAPTIVE-STC motif)
+                "MIMICRY": 6}            # 6 tx/budget giong ADAPTIVE
 
 
 def _tx_cost_eth(new):
@@ -546,6 +674,19 @@ def main():
     t_end = int(split["anchor_ts"].max()) + 10 * 365 * 24 * 3600     # = cutoff test cua 9c
     label_of = dict(zip(split["address"].str.lower(), split["label"].astype(int)))
     test = split[split["partition"] == "test"].reset_index(drop=True)
+
+    # Nap normal templates cho MIMICRY (chi lay tu TRAIN, chong ro ri test info)
+    normal_templates = []
+    if "MIMICRY" in args.attacks:
+        print(f"Loading normal templates for MIMICRY...")
+        normal_templates = load_normal_templates(
+            normal_hop1_dir=k2.NORMAL_HOP1_DIR,
+            split_df=split, n_sample=100, seed=args.seed,
+        )
+        print(f"  Loaded {len(normal_templates)} normal templates "
+              f"(train set, 10-1500 txs each)")
+        if not normal_templates:
+            raise RuntimeError("MIMICRY: khong co template nao hop le")
     if args.max_targets:   # lay mau NGAU NHIEN co dinh seed (head() co the lech theo thoi gian/nhan)
         test = test.sample(n=min(args.max_targets, len(test)), random_state=0).reset_index(drop=True)
     print(f"Test targets: {len(test)} (phishing={int((test['label']==1).sum())})")
@@ -586,7 +727,8 @@ def main():
         if label == 1:
             last_real = _last_ts(c.txs)
             ctx = {"model": model, "stats": stats, "device": device, "cache": c,
-                   "build_fn": build_graph, "n_cands": args.greedy_cands}
+                   "build_fn": build_graph, "n_cands": args.greedy_cands,
+                   "normal_templates": normal_templates}
             for atk in args.attacks:
                 for b in args.budgets:
                     new, wal = ATTACKS[atk](c.txs, addr, b, _atk_rng(args.seed, addr, ATTACK_IDS[atk], b),
