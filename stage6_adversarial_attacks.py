@@ -350,8 +350,9 @@ def attack_defense_adaptive(raw, target, b, rng, pool, model=None, stats=None,
         return [], set()
 
     # Chia budget: moi step = 1 unit (6 tx), stop khi het budget hoac flipped
+    patience, no_improve = 3, 0
     for step in range(b):
-        if cur < 0.3:   # da flip rong rai, stop
+        if cur < 0.1:   # da flip rong rai (threshold thap hon)
             break
         best = None
         for ci, params in enumerate(param_grid):
@@ -366,8 +367,15 @@ def attack_defense_adaptive(raw, target, b, rng, pool, model=None, stats=None,
             pv = prob(acc + cand_txs)
             if pv is not None and (best is None or pv < best[0]):
                 best = (pv, cand_txs, cand_wal)
-        if best is None or best[0] >= cur - 1e-4:
-            break   # khong candidate nao giam P -> stop
+        if best is None:
+            break   # khong motif nao build duoc graph -> stop
+        # Luon accept best (ke ca khi P khong giam) - thuong co cumulative effect
+        if best[0] >= cur - 1e-4:
+            no_improve += 1
+            if no_improve >= patience:   # 3 steps lien tiep khong giam P -> stop
+                break
+        else:
+            no_improve = 0
         cur, acc, wal = best[0], acc + best[1], wal | best[2]
     return acc, wal
 
